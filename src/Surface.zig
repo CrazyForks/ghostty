@@ -253,6 +253,7 @@ const DerivedConfig = struct {
     mouse_shift_capture: configpkg.MouseShiftCapture,
     macos_non_native_fullscreen: configpkg.NonNativeFullscreen,
     macos_option_as_alt: ?configpkg.OptionAsAlt,
+    selection_clear_on_typing: bool,
     vt_kam_allowed: bool,
     window_padding_top: u32,
     window_padding_bottom: u32,
@@ -316,6 +317,7 @@ const DerivedConfig = struct {
             .mouse_shift_capture = config.@"mouse-shift-capture",
             .macos_non_native_fullscreen = config.@"macos-non-native-fullscreen",
             .macos_option_as_alt = config.@"macos-option-as-alt",
+            .selection_clear_on_typing = config.@"selection-clear-on-typing",
             .vt_kam_allowed = config.@"vt-kam-allowed",
             .window_padding_top = config.@"window-padding-y".top_left,
             .window_padding_bottom = config.@"window-padding-y".bottom_right,
@@ -518,7 +520,7 @@ pub fn init(
     };
 
     // The command we're going to execute
-    const command: ?[]const u8 = if (app.first)
+    const command: ?configpkg.Command = if (app.first)
         config.@"initial-command" orelse config.command
     else
         config.command;
@@ -650,21 +652,19 @@ pub fn init(
         // title to the command being executed. This allows window managers
         // to set custom styling based on the command being executed.
         const v = command orelse break :xdg;
-        if (v.len > 0) {
-            const title = alloc.dupeZ(u8, v) catch |err| {
-                log.warn(
-                    "error copying command for title, title will not be set err={}",
-                    .{err},
-                );
-                break :xdg;
-            };
-            defer alloc.free(title);
-            _ = try rt_app.performAction(
-                .{ .surface = self },
-                .set_title,
-                .{ .title = title },
+        const title = v.string(alloc) catch |err| {
+            log.warn(
+                "error copying command for title, title will not be set err={}",
+                .{err},
             );
-        }
+            break :xdg;
+        };
+        defer alloc.free(title);
+        _ = try rt_app.performAction(
+            .{ .surface = self },
+            .set_title,
+            .{ .title = title },
+        );
     }
 
     // We are no longer the first surface
@@ -932,6 +932,16 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         .present_surface => try self.presentSurface(),
 
         .password_input => |v| try self.passwordInput(v),
+
+        .ring_bell => {
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .ring_bell,
+                {},
+            ) catch |err| {
+                log.warn("apprt failed to ring bell={}", .{err});
+            };
+        },
     }
 }
 
@@ -1033,9 +1043,64 @@ fn mouseRefreshLinks(
     // If the position is outside our viewport, do nothing
     if (pos.x < 0 or pos.y < 0) return;
 
+    // Update the last point that we checked for links so we don't
+    // recheck if the mouse moves some pixels to the same point.
     self.mouse.link_point = pos_vp;
 
-    if (try self.linkAtPos(pos)) |link| {
+    // We use an arena for everything below to make things easy to clean up.
+    // In the case we don't do any allocs this is very cheap to setup
+    // (effectively just struct init).
+    var arena = ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Get our link at the current position. This returns null if there
+    // isn't a link OR if we shouldn't be showing links for some reason
+    // (see further comments for cases).
+    const link_: ?apprt.action.MouseOverLink = link: {
+        // If we clicked and our mouse moved cells then we never
+        // highlight links until the mouse is unclicked. This follows
+        // standard macOS and Linux behavior where a click and drag cancels
+        // mouse actions.
+        const left_idx = @intFromEnum(input.MouseButton.left);
+        if (self.mouse.click_state[left_idx] == .press) click: {
+            const pin = self.mouse.left_click_pin orelse break :click;
+            const click_pt = self.io.terminal.screen.pages.pointFromPin(
+                .viewport,
+                pin.*,
+            ) orelse break :click;
+
+            if (!click_pt.coord().eql(pos_vp)) {
+                log.debug("mouse moved while left click held, ignoring link hover", .{});
+                break :link null;
+            }
+        }
+
+        const link = (try self.linkAtPos(pos)) orelse break :link null;
+        switch (link[0]) {
+            .open => {
+                const str = try self.io.terminal.screen.selectionString(alloc, .{
+                    .sel = link[1],
+                    .trim = false,
+                });
+                break :link .{ .url = str };
+            },
+
+            ._open_osc8 => {
+                // Show the URL in the status bar
+                const pin = link[1].start();
+                const uri = self.osc8URI(pin) orelse {
+                    log.warn("failed to get URI for OSC8 hyperlink", .{});
+                    break :link null;
+                };
+                break :link .{ .url = uri };
+            },
+        }
+    };
+
+    // If we found a link, setup our internal state and notify the
+    // apprt so it can highlight it.
+    if (link_) |link| {
         self.renderer_state.mouse.point = pos_vp;
         self.mouse.over_link = true;
         self.renderer_state.terminal.screen.dirty.hyperlink_hover = true;
@@ -1044,38 +1109,18 @@ fn mouseRefreshLinks(
             .mouse_shape,
             .pointer,
         );
-
-        switch (link[0]) {
-            .open => {
-                const str = try self.io.terminal.screen.selectionString(self.alloc, .{
-                    .sel = link[1],
-                    .trim = false,
-                });
-                defer self.alloc.free(str);
-                _ = try self.rt_app.performAction(
-                    .{ .surface = self },
-                    .mouse_over_link,
-                    .{ .url = str },
-                );
-            },
-
-            ._open_osc8 => link: {
-                // Show the URL in the status bar
-                const pin = link[1].start();
-                const uri = self.osc8URI(pin) orelse {
-                    log.warn("failed to get URI for OSC8 hyperlink", .{});
-                    break :link;
-                };
-                _ = try self.rt_app.performAction(
-                    .{ .surface = self },
-                    .mouse_over_link,
-                    .{ .url = uri },
-                );
-            },
-        }
-
+        _ = try self.rt_app.performAction(
+            .{ .surface = self },
+            .mouse_over_link,
+            link,
+        );
         try self.queueRender();
-    } else if (over_link) {
+        return;
+    }
+
+    // No link, if we're previously over a link then we need to clear
+    // the over-link apprt state.
+    if (over_link) {
         _ = try self.rt_app.performAction(
             .{ .surface = self },
             .mouse_shape,
@@ -1087,6 +1132,7 @@ fn mouseRefreshLinks(
             .{ .url = "" },
         );
         try self.queueRender();
+        return;
     }
 }
 
@@ -1643,7 +1689,9 @@ pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
     if (self.renderer_state.preedit != null or
         preedit_ != null)
     {
-        self.setSelection(null) catch {};
+        if (self.config.selection_clear_on_typing) {
+            self.setSelection(null) catch {};
+        }
     }
 
     // We always clear our prior preedit
@@ -1716,6 +1764,8 @@ pub fn keyEventIsBinding(
     // Our keybinding set is either our current nested set (for
     // sequences) or the root set.
     const set = self.keyboard.bindings orelse &self.config.keybind.set;
+
+    // log.warn("text keyEventIsBinding event={} match={}", .{ event, set.getEvent(event) != null });
 
     // If we have a keybinding for this event then we return true.
     return set.getEvent(event) != null;
@@ -1826,7 +1876,7 @@ pub fn keyCallback(
     // Process the cursor state logic. This will update the cursor shape if
     // needed, depending on the key state.
     if ((SurfaceMouse{
-        .physical_key = event.physical_key,
+        .physical_key = event.key,
         .mouse_event = self.io.terminal.flags.mouse_event,
         .mouse_shape = self.io.terminal.mouse_shape,
         .mods = self.mouse.mods,
@@ -1851,12 +1901,12 @@ pub fn keyCallback(
             // if we didn't have a previous event and this is a release
             // event then we just want to set it to null.
             const prev = self.pressed_key orelse break :event null;
-            if (prev.key == copy.key) copy.key = .invalid;
+            if (prev.key == copy.key) copy.key = .unidentified;
         }
 
         // If our key is invalid and we have no mods, then we're done!
         // This helps catch the state that we naturally released all keys.
-        if (copy.key == .invalid and copy.mods.empty()) break :event null;
+        if (copy.key == .unidentified and copy.mods.empty()) break :event null;
 
         break :event copy;
     };
@@ -1884,7 +1934,13 @@ pub fn keyCallback(
     if (!event.key.modifier()) {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
-        try self.setSelection(null);
+
+        if (self.config.selection_clear_on_typing or
+            event.key == .escape)
+        {
+            try self.setSelection(null);
+        }
+
         try self.io.terminal.scrollViewport(.{ .bottom = {} });
         try self.queueRender();
     }
@@ -2251,7 +2307,7 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
         pressed_key.action = .release;
 
         // Release the full key first
-        if (pressed_key.key != .invalid) {
+        if (pressed_key.key != .unidentified) {
             assert(self.keyCallback(pressed_key) catch |err| err: {
                 log.warn("error releasing key on focus loss err={}", .{err});
                 break :err .ignored;
@@ -2271,8 +2327,15 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
             if (@field(pressed_key.mods, key)) {
                 @field(pressed_key.mods, key) = false;
                 inline for (&.{ "right", "left" }) |side| {
-                    const keyname = if (comptime std.mem.eql(u8, key, "ctrl")) "control" else key;
-                    pressed_key.key = @field(input.Key, side ++ "_" ++ keyname);
+                    const keyname = comptime keyname: {
+                        break :keyname if (std.mem.eql(u8, key, "ctrl"))
+                            "control"
+                        else if (std.mem.eql(u8, key, "super"))
+                            "meta"
+                        else
+                            key;
+                    };
+                    pressed_key.key = @field(input.Key, keyname ++ "_" ++ side);
                     if (pressed_key.key != original_key) {
                         assert(self.keyCallback(pressed_key) catch |err| err: {
                             log.warn("error releasing key on focus loss err={}", .{err});
@@ -4075,6 +4138,14 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             }, .unlocked);
         },
 
+        .scroll_to_selection => {
+            self.renderer_state.mutex.lock();
+            defer self.renderer_state.mutex.unlock();
+            const sel = self.io.terminal.screen.selection orelse return false;
+            const tl = sel.topLeft(&self.io.terminal.screen);
+            self.io.terminal.screen.scroll(.{ .pin = tl });
+        },
+
         .scroll_page_up => {
             const rows: isize = @intCast(self.size.grid().rows);
             self.io.queueMessage(.{
@@ -4245,10 +4316,22 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
+        .toggle_window_float_on_top => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .float_window,
+            .toggle,
+        ),
+
         .toggle_secure_input => return try self.rt_app.performAction(
             .{ .surface = self },
             .secure_input,
             .toggle,
+        ),
+
+        .toggle_command_palette => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .toggle_command_palette,
+            {},
         ),
 
         .select_all => {

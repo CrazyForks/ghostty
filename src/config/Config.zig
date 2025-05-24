@@ -22,7 +22,6 @@ const inputpkg = @import("../input.zig");
 const terminal = @import("../terminal/main.zig");
 const internal_os = @import("../os/main.zig");
 const cli = @import("../cli.zig");
-const Command = @import("../Command.zig");
 
 const conditional = @import("conditional.zig");
 const Conditional = conditional.Conditional;
@@ -34,6 +33,7 @@ const KeyValue = @import("key.zig").Value;
 const ErrorList = @import("ErrorList.zig");
 const MetricModifier = fontpkg.Metrics.Modifier;
 const help_strings = @import("help_strings");
+pub const Command = @import("command.zig").Command;
 const RepeatableStringMap = @import("RepeatableStringMap.zig");
 pub const Path = @import("path.zig").Path;
 pub const RepeatablePath = @import("path.zig").RepeatablePath;
@@ -474,6 +474,21 @@ foreground: Color = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF },
 /// selection color will vary across the selection.
 @"selection-invert-fg-bg": bool = false,
 
+/// Whether to clear selected text when typing. This defaults to `true`.
+/// This is typical behavior for most terminal emulators as well as
+/// text input fields. If you set this to `false`, then the selected text
+/// will not be cleared when typing.
+///
+/// "Typing" is specifically defined as any non-modifier (shift, control,
+/// alt, etc.) keypress that produces data to be sent to the application
+/// running within the terminal (e.g. the shell). Additionally, selection
+/// is cleared when any preedit or composition state is started (e.g.
+/// when typing languages such as Japanese).
+///
+/// If this is `false`, then the selection can still be manually
+/// cleared by clicking once or by pressing `escape`.
+@"selection-clear-on-typing": bool = true,
+
 /// The minimum contrast ratio between the foreground and background colors.
 /// The contrast ratio is a value between 1 and 21. A value of 1 allows for no
 /// contrast (e.g. black on black). This value is the contrast ratio as defined
@@ -691,8 +706,17 @@ palette: Palette = .{},
 ///   * `passwd` entry (user information)
 ///
 /// This can contain additional arguments to run the command with. If additional
-/// arguments are provided, the command will be executed using `/bin/sh -c`.
-/// Ghostty does not do any shell command parsing.
+/// arguments are provided, the command will be executed using `/bin/sh -c`
+/// to offload shell argument expansion.
+///
+/// To avoid shell expansion altogether, prefix the command with `direct:`,
+/// e.g. `direct:nvim foo`. This will avoid the roundtrip to `/bin/sh` but will
+/// also not support any shell parsing such as arguments with spaces, filepaths
+/// with `~`, globs, etc.
+///
+/// You can also explicitly prefix the command with `shell:` to always
+/// wrap the command in a shell. This can be used to ensure our heuristics
+/// to choose the right mode are not used in case they are wrong.
 ///
 /// This command will be used for all new terminal surfaces, i.e. new windows,
 /// tabs, etc. If you want to run a command only for the first terminal surface
@@ -702,7 +726,7 @@ palette: Palette = .{},
 /// arguments. For example, `ghostty -e fish --with --custom --args`.
 /// This flag sets the `initial-command` configuration, see that for more
 /// information.
-command: ?[]const u8 = null,
+command: ?Command = null,
 
 /// This is the same as "command", but only applies to the first terminal
 /// surface created when Ghostty starts. Subsequent terminal surfaces will use
@@ -717,6 +741,10 @@ command: ?[]const u8 = null,
 /// with arguments directly: you can use the `-e` flag. For example: `ghostty -e
 /// fish --with --custom --args`. The `-e` flag automatically forces some
 /// other behaviors as well:
+///
+///   * Disables shell expansion since the input is expected to already
+///     be shell-expanded by the upstream (e.g. the shell used to type in
+///     the `ghostty -e` command).
 ///
 ///   * `gtk-single-instance=false` - This ensures that a new instance is
 ///     launched and the CLI args are respected.
@@ -735,7 +763,7 @@ command: ?[]const u8 = null,
 ///     name your binary appropriately or source the shell integration script
 ///     manually.
 ///
-@"initial-command": ?[]const u8 = null,
+@"initial-command": ?Command = null,
 
 /// Extra environment variables to pass to commands launched in a terminal
 /// surface. The format is `env=KEY=VALUE`.
@@ -916,12 +944,46 @@ class: ?[:0]const u8 = null,
 /// Trigger: `+`-separated list of keys and modifiers. Example: `ctrl+a`,
 /// `ctrl+shift+b`, `up`.
 ///
-/// Valid keys are currently only listed in the
-/// [Ghostty source code](https://github.com/ghostty-org/ghostty/blob/d6e76858164d52cff460fedc61ddf2e560912d71/src/input/key.zig#L255).
-/// This is a documentation limitation and we will improve this in the future.
-/// A common gotcha is that numeric keys are written as words: e.g. `one`,
-/// `two`, `three`, etc. and not `1`, `2`, `3`. This will also be improved in
-/// the future.
+/// If the key is a single Unicode codepoint, the trigger will match
+/// any presses that produce that codepoint. These are impacted by
+/// keyboard layouts. For example, `a` will match the `a` key on a
+/// QWERTY keyboard, but will match the `q` key on a AZERTY keyboard
+/// (assuming US physical layout).
+///
+/// For Unicode codepoints, matching is done by comparing the set of
+/// modifiers with the unmodified codepoint. The unmodified codepoint is
+/// sometimes called an "unshifted character" in other software, but all
+/// modifiers are considered, not only shift. For example, `ctrl+a` will match
+/// `a` but not `ctrl+shift+a` (which is `A` on a US keyboard).
+///
+/// Further, codepoint matching is case-insensitive and the unmodified
+/// codepoint is always case folded for comparison. As a result,
+/// `ctrl+A` configured will match when `ctrl+a` is pressed. Note that
+/// this means some key combinations are impossible depending on keyboard
+/// layout. For example, `ctrl+_` is impossible on a US keyboard because
+/// `_` is `shift+-` and `ctrl+shift+-` is not equal to `ctrl+_` (because
+/// the modifiers don't match!). More details on impossible key combinations
+/// can be found at this excellent source written by Qt developers:
+/// https://doc.qt.io/qt-6/qkeysequence.html#keyboard-layout-issues
+///
+/// Physical key codes can be specified by using any of the key codes
+/// as specified by the [W3C specification](https://www.w3.org/TR/uievents-code/).
+/// For example, `KeyA` will match the physical `a` key on a US standard
+/// keyboard regardless of the keyboard layout. These are case-sensitive.
+///
+/// For aesthetic reasons, the w3c codes also support snake case. For
+/// example, `key_a` is equivalent to `KeyA`. The only exceptions are
+/// function keys, e.g. `F1` is `f1` (no underscore). This is a consequence
+/// of our internal code using snake case but is purposely supported
+/// and tested so it is safe to use. It allows an all-lowercase binding
+/// which I find more aesthetically pleasing.
+///
+/// Function keys such as `insert`, `up`, `f5`, etc. are also specified
+/// using the keys as specified by the previously linked W3C specification.
+///
+/// Physical keys always match with a higher priority than Unicode codepoints,
+/// so if you specify both `a` and `KeyA`, the physical key will always be used
+/// regardless of what order they are configured.
 ///
 /// Valid modifiers are `shift`, `ctrl` (alias: `control`), `alt` (alias: `opt`,
 /// `option`), and `super` (alias: `cmd`, `command`). You may use the modifier
@@ -940,11 +1002,6 @@ class: ?[:0]const u8 = null,
 ///     but valid.
 ///
 ///   * only a single key input is allowed, `ctrl+a+b` is invalid.
-///
-///   * the key input can be prefixed with `physical:` to specify a
-///     physical key mapping rather than a logical one. A physical key
-///     mapping responds to the hardware keycode and not the keycode
-///     translated by any system keyboard layouts. Example: "ctrl+physical:a"
 ///
 /// You may also specify multiple triggers separated by `>` to require a
 /// sequence of triggers to activate the action. For example,
@@ -1068,12 +1125,33 @@ class: ?[:0]const u8 = null,
 /// `global:unconsumed:ctrl+a=reload_config` will make the keybind global
 /// and not consume the input to reload the config.
 ///
-/// Note: `global:` is only supported on macOS. On macOS,
-/// this feature requires accessibility permissions to be granted to Ghostty.
-/// When a `global:` keybind is specified and Ghostty is launched or reloaded,
-/// Ghostty will attempt to request these permissions. If the permissions are
-/// not granted, the keybind will not work. On macOS, you can find these
-/// permissions in System Preferences -> Privacy & Security -> Accessibility.
+/// Note: `global:` is only supported on macOS and certain Linux platforms.
+///
+/// On macOS, this feature requires accessibility permissions to be granted
+/// to Ghostty. When a `global:` keybind is specified and Ghostty is launched
+/// or reloaded, Ghostty will attempt to request these permissions.
+/// If the permissions are not granted, the keybind will not work. On macOS,
+/// you can find these permissions in System Preferences -> Privacy & Security
+/// -> Accessibility.
+///
+/// On Linux, you need a desktop environment that implements the
+/// [Global Shortcuts](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html)
+/// protocol as a part of its XDG desktop protocol implementation.
+/// Desktop environments that are known to support (or not support)
+/// global shortcuts include:
+///
+///  - Users using KDE Plasma (since [5.27](https://kde.org/announcements/plasma/5/5.27.0/#wayland))
+///    and GNOME (since [48](https://release.gnome.org/48/#and-thats-not-all)) should be able
+///    to use global shortcuts with little to no configuration.
+///
+///  - Some manual configuration is required on Hyprland. Consult the steps
+///    outlined on the [Hyprland Wiki](https://wiki.hyprland.org/Configuring/Binds/#dbus-global-shortcuts)
+///    to set up global shortcuts correctly.
+///    (Important: [`xdg-desktop-portal-hyprland`](https://wiki.hyprland.org/Hypr-Ecosystem/xdg-desktop-portal-hyprland/)
+///    must also be installed!)
+///
+///  - Notably, global shortcuts have not been implemented on wlroots-based
+///    compositors like Sway (see [upstream issue](https://github.com/emersion/xdg-desktop-portal-wlr/issues/240)).
 keybind: Keybinds = .{},
 
 /// Horizontal window padding. This applies padding between the terminal cells
@@ -1848,6 +1926,49 @@ keybind: Keybinds = .{},
 /// open terminals.
 @"custom-shader-animation": CustomShaderAnimation = .true,
 
+/// Bell features to enable if bell support is available in your runtime. Not
+/// all features are available on all runtimes. The format of this is a list of
+/// features to enable separated by commas. If you prefix a feature with `no-`
+/// then it is disabled. If you omit a feature, its default value is used.
+///
+/// Valid values are:
+///
+///  * `system`
+///
+///    Instructs the system to notify the user using built-in system functions.
+///    This could result in an audiovisual effect, a notification, or something
+///    else entirely. Changing these effects require altering system settings:
+///    for instance under the "Sound > Alert Sound" setting in GNOME,
+///    or the "Accessibility > System Bell" settings in KDE Plasma. (GTK only)
+///
+///  * `audio`
+///
+///    Play a custom sound. (GTK only)
+///
+/// Example: `audio`, `no-audio`, `system`, `no-system`:
+///
+/// On macOS, if the app is unfocused, it will bounce the app icon in the dock
+/// once. Additionally, the title of the window with the alerted terminal
+/// surface will contain a bell emoji (🔔) until the terminal is focused
+/// or a key is pressed. These are not currently configurable since they're
+/// considered unobtrusive.
+///
+/// By default, no bell features are enabled.
+@"bell-features": BellFeatures = .{},
+
+/// If `audio` is an enabled bell feature, this is a path to an audio file. If
+/// the path is not absolute, it is considered relative to the directory of the
+/// configuration file that it is referenced from, or from the current working
+/// directory if this is used as a CLI flag. The path may be prefixed with `~/`
+/// to reference the user's home directory. (GTK only)
+@"bell-audio-path": ?Path = null,
+
+/// If `audio` is an enabled bell feature, this is the volume to play the audio
+/// file at (relative to the system volume). This is a floating point number
+/// ranging from 0.0 (silence) to 1.0 (as loud as possible). The default is 0.5.
+/// (GTK only)
+@"bell-audio-volume": f64 = 0.5,
+
 /// Control the in-app notifications that Ghostty shows.
 ///
 /// On Linux (GTK), in-app notifications show up as toasts. Toasts appear
@@ -1969,7 +2090,7 @@ keybind: Keybinds = .{},
 
 /// macOS doesn't have a distinct "alt" key and instead has the "option"
 /// key which behaves slightly differently. On macOS by default, the
-/// option key plus a character will sometimes produces a Unicode character.
+/// option key plus a character will sometimes produce a Unicode character.
 /// For example, on US standard layouts option-b produces "∫". This may be
 /// undesirable if you want to use "option" as an "alt" key for keybindings
 /// in terminal programs or shells.
@@ -2240,6 +2361,18 @@ keybind: Keybinds = .{},
 @"gtk-wide-tabs": bool = true,
 
 /// Custom CSS files to be loaded.
+///
+/// GTK CSS documentation can be found at the following links:
+///
+///   * <https://docs.gtk.org/gtk4/css-overview.html> - An overview of GTK CSS.
+///   * <https://docs.gtk.org/gtk4/css-properties.html> - A comprehensive list
+///     of supported CSS properties.
+///
+/// Launch Ghostty with `env GTK_DEBUG=interactive ghostty` to tweak Ghostty's
+/// CSS in real time using the GTK Inspector. Errors in your CSS files would
+/// also be reported in the terminal you started Ghostty from. See
+/// <https://developer.gnome.org/documentation/tools/inspector.html> for more
+/// information about the GTK Inspector.
 ///
 /// This configuration can be repeated multiple times to load multiple files.
 /// Prepend a ? character to the file path to suppress errors if the file does
@@ -2564,21 +2697,17 @@ pub fn loadCliArgs(self: *Config, alloc_gpa: Allocator) !void {
 
             // Next, take all remaining args and use that to build up
             // a command to execute.
-            var command = std.ArrayList(u8).init(arena_alloc);
-            errdefer command.deinit();
+            var builder = std.ArrayList([:0]const u8).init(arena_alloc);
+            errdefer builder.deinit();
             for (args) |arg_raw| {
                 const arg = std.mem.sliceTo(arg_raw, 0);
-                try self._replay_steps.append(
-                    arena_alloc,
-                    .{ .arg = try arena_alloc.dupe(u8, arg) },
-                );
-
-                try command.appendSlice(arg);
-                try command.append(' ');
+                const copy = try arena_alloc.dupeZ(u8, arg);
+                try self._replay_steps.append(arena_alloc, .{ .arg = copy });
+                try builder.append(copy);
             }
 
             self.@"_xdg-terminal-exec" = true;
-            self.@"initial-command" = command.items[0 .. command.items.len - 1];
+            self.@"initial-command" = .{ .direct = try builder.toOwnedSlice() };
             return;
         }
     }
@@ -3023,7 +3152,7 @@ pub fn finalize(self: *Config) !void {
             // We don't do this in flatpak because SHELL in Flatpak is always
             // set to /bin/sh.
             if (self.command) |cmd|
-                log.info("shell src=config value={s}", .{cmd})
+                log.info("shell src=config value={}", .{cmd})
             else shell_env: {
                 // Flatpak always gets its shell from outside the sandbox
                 if (internal_os.isFlatpak()) break :shell_env;
@@ -3035,7 +3164,9 @@ pub fn finalize(self: *Config) !void {
 
                 if (std.process.getEnvVarOwned(alloc, "SHELL")) |value| {
                     log.info("default shell source=env value={s}", .{value});
-                    self.command = value;
+
+                    const copy = try alloc.dupeZ(u8, value);
+                    self.command = .{ .shell = copy };
 
                     // If we don't need the working directory, then we can exit now.
                     if (!wd_home) break :command;
@@ -3046,7 +3177,7 @@ pub fn finalize(self: *Config) !void {
                 .windows => {
                     if (self.command == null) {
                         log.warn("no default shell found, will default to using cmd", .{});
-                        self.command = "cmd.exe";
+                        self.command = .{ .shell = "cmd.exe" };
                     }
 
                     if (wd_home) {
@@ -3063,7 +3194,7 @@ pub fn finalize(self: *Config) !void {
                     if (self.command == null) {
                         if (pw.shell) |sh| {
                             log.info("default shell src=passwd value={s}", .{sh});
-                            self.command = sh;
+                            self.command = .{ .shell = sh };
                         }
                     }
 
@@ -3145,13 +3276,13 @@ pub fn parseManuallyHook(
 
         // Build up the command. We don't clean this up because we take
         // ownership in our allocator.
-        var command = std.ArrayList(u8).init(alloc);
+        var command: std.ArrayList([:0]const u8) = .init(alloc);
         errdefer command.deinit();
 
         while (iter.next()) |param| {
-            try self._replay_steps.append(alloc, .{ .arg = try alloc.dupe(u8, param) });
-            try command.appendSlice(param);
-            try command.append(' ');
+            const copy = try alloc.dupeZ(u8, param);
+            try self._replay_steps.append(alloc, .{ .arg = copy });
+            try command.append(copy);
         }
 
         if (command.items.len == 0) {
@@ -3167,9 +3298,8 @@ pub fn parseManuallyHook(
             return false;
         }
 
-        self.@"initial-command" = command.items[0 .. command.items.len - 1];
-
         // See "command" docs for the implied configurations and why.
+        self.@"initial-command" = .{ .direct = command.items };
         self.@"gtk-single-instance" = .false;
         self.@"quit-after-last-window-closed" = true;
         self.@"quit-after-last-window-closed-delay" = null;
@@ -3184,7 +3314,7 @@ pub fn parseManuallyHook(
     // Keep track of our input args for replay
     try self._replay_steps.append(
         alloc,
-        .{ .arg = try alloc.dupe(u8, arg) },
+        .{ .arg = try alloc.dupeZ(u8, arg) },
     );
 
     // If we didn't find a special case, continue parsing normally
@@ -3377,6 +3507,16 @@ fn equalField(comptime T: type, old: T, new: T) bool {
         [:0]const u8,
         => return std.mem.eql(u8, old, new),
 
+        []const [:0]const u8,
+        => {
+            if (old.len != new.len) return false;
+            for (old, new) |a, b| {
+                if (!std.mem.eql(u8, a, b)) return false;
+            }
+
+            return true;
+        },
+
         else => {},
     }
 
@@ -3412,6 +3552,8 @@ fn equalField(comptime T: type, old: T, new: T) bool {
         },
 
         .@"union" => |info| {
+            if (@hasDecl(T, "equal")) return old.equal(new);
+
             const tag_type = info.tag_type.?;
             const old_tag = std.meta.activeTag(old);
             const new_tag = std.meta.activeTag(new);
@@ -3441,7 +3583,7 @@ fn equalField(comptime T: type, old: T, new: T) bool {
 const Replay = struct {
     const Step = union(enum) {
         /// An argument to parse as if it came from the CLI or file.
-        arg: []const u8,
+        arg: [:0]const u8,
 
         /// A base path to expand relative paths against.
         expand: []const u8,
@@ -3481,7 +3623,7 @@ const Replay = struct {
             return switch (self) {
                 .@"-e" => self,
                 .diagnostic => |v| .{ .diagnostic = try v.clone(alloc) },
-                .arg => |v| .{ .arg = try alloc.dupe(u8, v) },
+                .arg => |v| .{ .arg = try alloc.dupeZ(u8, v) },
                 .expand => |v| .{ .expand = try alloc.dupe(u8, v) },
                 .conditional_arg => |v| conditional: {
                     var conds = try alloc.alloc(Conditional, v.conditions.len);
@@ -3886,6 +4028,24 @@ pub const Palette = struct {
     /// The actual value that is updated as we parse.
     value: terminal.color.Palette = terminal.color.default,
 
+    /// ghostty_config_palette_s
+    pub const C = extern struct {
+        colors: [265]Color.C,
+    };
+
+    pub fn cval(self: Self) Palette.C {
+        var result: Palette.C = undefined;
+        for (self.value, 0..) |color, i| {
+            result.colors[i] = Color.C{
+                .r = color.r,
+                .g = color.g,
+                .b = color.b,
+            };
+        }
+
+        return result;
+    }
+
     pub fn parseCLI(
         self: *Self,
         input: ?[]const u8,
@@ -4269,12 +4429,12 @@ pub const Keybinds = struct {
         // keybinds for opening and reloading config
         try self.set.put(
             alloc,
-            .{ .key = .{ .translated = .comma }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true }) },
+            .{ .key = .{ .unicode = ',' }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true }) },
             .{ .reload_config = {} },
         );
         try self.set.put(
             alloc,
-            .{ .key = .{ .translated = .comma }, .mods = inputpkg.ctrlOrSuper(.{}) },
+            .{ .key = .{ .unicode = ',' }, .mods = inputpkg.ctrlOrSuper(.{}) },
             .{ .open_config = {} },
         );
 
@@ -4288,12 +4448,12 @@ pub const Keybinds = struct {
             if (!builtin.target.os.tag.isDarwin()) {
                 try self.set.put(
                     alloc,
-                    .{ .key = .{ .translated = .insert }, .mods = .{ .ctrl = true } },
+                    .{ .key = .{ .physical = .insert }, .mods = .{ .ctrl = true } },
                     .{ .copy_to_clipboard = {} },
                 );
                 try self.set.put(
                     alloc,
-                    .{ .key = .{ .translated = .insert }, .mods = .{ .shift = true } },
+                    .{ .key = .{ .physical = .insert }, .mods = .{ .shift = true } },
                     .{ .paste_from_clipboard = {} },
                 );
             }
@@ -4307,12 +4467,12 @@ pub const Keybinds = struct {
 
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .c }, .mods = mods },
+                .{ .key = .{ .unicode = 'c' }, .mods = mods },
                 .{ .copy_to_clipboard = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .v }, .mods = mods },
+                .{ .key = .{ .unicode = 'v' }, .mods = mods },
                 .{ .paste_from_clipboard = {} },
             );
         }
@@ -4323,84 +4483,84 @@ pub const Keybinds = struct {
         // set the expected keybind for the menu.
         try self.set.put(
             alloc,
-            .{ .key = .{ .translated = .plus }, .mods = inputpkg.ctrlOrSuper(.{}) },
+            .{ .key = .{ .physical = .equal }, .mods = inputpkg.ctrlOrSuper(.{}) },
             .{ .increase_font_size = 1 },
         );
         try self.set.put(
             alloc,
-            .{ .key = .{ .translated = .equal }, .mods = inputpkg.ctrlOrSuper(.{}) },
+            .{ .key = .{ .unicode = '+' }, .mods = inputpkg.ctrlOrSuper(.{}) },
             .{ .increase_font_size = 1 },
         );
 
         try self.set.put(
             alloc,
-            .{ .key = .{ .translated = .minus }, .mods = inputpkg.ctrlOrSuper(.{}) },
+            .{ .key = .{ .unicode = '-' }, .mods = inputpkg.ctrlOrSuper(.{}) },
             .{ .decrease_font_size = 1 },
         );
         try self.set.put(
             alloc,
-            .{ .key = .{ .translated = .zero }, .mods = inputpkg.ctrlOrSuper(.{}) },
+            .{ .key = .{ .unicode = '0' }, .mods = inputpkg.ctrlOrSuper(.{}) },
             .{ .reset_font_size = {} },
         );
 
         try self.set.put(
             alloc,
-            .{ .key = .{ .translated = .j }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true }) },
+            .{ .key = .{ .unicode = 'j' }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true }) },
             .{ .write_screen_file = .paste },
         );
 
         try self.set.put(
             alloc,
-            .{ .key = .{ .translated = .j }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true, .alt = true }) },
+            .{ .key = .{ .unicode = 'j' }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true, .alt = true }) },
             .{ .write_screen_file = .open },
         );
 
         // Expand Selection
         try self.set.putFlags(
             alloc,
-            .{ .key = .{ .translated = .left }, .mods = .{ .shift = true } },
+            .{ .key = .{ .physical = .arrow_left }, .mods = .{ .shift = true } },
             .{ .adjust_selection = .left },
             .{ .performable = true },
         );
         try self.set.putFlags(
             alloc,
-            .{ .key = .{ .translated = .right }, .mods = .{ .shift = true } },
+            .{ .key = .{ .physical = .arrow_right }, .mods = .{ .shift = true } },
             .{ .adjust_selection = .right },
             .{ .performable = true },
         );
         try self.set.putFlags(
             alloc,
-            .{ .key = .{ .translated = .up }, .mods = .{ .shift = true } },
+            .{ .key = .{ .physical = .arrow_up }, .mods = .{ .shift = true } },
             .{ .adjust_selection = .up },
             .{ .performable = true },
         );
         try self.set.putFlags(
             alloc,
-            .{ .key = .{ .translated = .down }, .mods = .{ .shift = true } },
+            .{ .key = .{ .physical = .arrow_down }, .mods = .{ .shift = true } },
             .{ .adjust_selection = .down },
             .{ .performable = true },
         );
         try self.set.putFlags(
             alloc,
-            .{ .key = .{ .translated = .page_up }, .mods = .{ .shift = true } },
+            .{ .key = .{ .physical = .page_up }, .mods = .{ .shift = true } },
             .{ .adjust_selection = .page_up },
             .{ .performable = true },
         );
         try self.set.putFlags(
             alloc,
-            .{ .key = .{ .translated = .page_down }, .mods = .{ .shift = true } },
+            .{ .key = .{ .physical = .page_down }, .mods = .{ .shift = true } },
             .{ .adjust_selection = .page_down },
             .{ .performable = true },
         );
         try self.set.putFlags(
             alloc,
-            .{ .key = .{ .translated = .home }, .mods = .{ .shift = true } },
+            .{ .key = .{ .physical = .home }, .mods = .{ .shift = true } },
             .{ .adjust_selection = .home },
             .{ .performable = true },
         );
         try self.set.putFlags(
             alloc,
-            .{ .key = .{ .translated = .end }, .mods = .{ .shift = true } },
+            .{ .key = .{ .physical = .end }, .mods = .{ .shift = true } },
             .{ .adjust_selection = .end },
             .{ .performable = true },
         );
@@ -4408,12 +4568,12 @@ pub const Keybinds = struct {
         // Tabs common to all platforms
         try self.set.put(
             alloc,
-            .{ .key = .{ .translated = .tab }, .mods = .{ .ctrl = true, .shift = true } },
+            .{ .key = .{ .physical = .tab }, .mods = .{ .ctrl = true, .shift = true } },
             .{ .previous_tab = {} },
         );
         try self.set.put(
             alloc,
-            .{ .key = .{ .translated = .tab }, .mods = .{ .ctrl = true } },
+            .{ .key = .{ .physical = .tab }, .mods = .{ .ctrl = true } },
             .{ .next_tab = {} },
         );
 
@@ -4421,174 +4581,169 @@ pub const Keybinds = struct {
         if (comptime !builtin.target.os.tag.isDarwin()) {
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .n }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .key = .{ .unicode = 'n' }, .mods = .{ .ctrl = true, .shift = true } },
                 .{ .new_window = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .w }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .key = .{ .unicode = 'w' }, .mods = .{ .ctrl = true, .shift = true } },
                 .{ .close_surface = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .q }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .key = .{ .unicode = 'q' }, .mods = .{ .ctrl = true, .shift = true } },
                 .{ .quit = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .f4 }, .mods = .{ .alt = true } },
+                .{ .key = .{ .physical = .f4 }, .mods = .{ .alt = true } },
                 .{ .close_window = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .t }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .key = .{ .unicode = 't' }, .mods = .{ .ctrl = true, .shift = true } },
                 .{ .new_tab = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .w }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .key = .{ .unicode = 'w' }, .mods = .{ .ctrl = true, .shift = true } },
                 .{ .close_tab = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .left }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .key = .{ .physical = .arrow_left }, .mods = .{ .ctrl = true, .shift = true } },
                 .{ .previous_tab = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .right }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .key = .{ .physical = .arrow_right }, .mods = .{ .ctrl = true, .shift = true } },
                 .{ .next_tab = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .page_up }, .mods = .{ .ctrl = true } },
+                .{ .key = .{ .physical = .page_up }, .mods = .{ .ctrl = true } },
                 .{ .previous_tab = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .page_down }, .mods = .{ .ctrl = true } },
+                .{ .key = .{ .physical = .page_down }, .mods = .{ .ctrl = true } },
                 .{ .next_tab = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .o }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .key = .{ .unicode = 'o' }, .mods = .{ .ctrl = true, .shift = true } },
                 .{ .new_split = .right },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .e }, .mods = .{ .ctrl = true, .shift = true } },
+                .{ .key = .{ .unicode = 'e' }, .mods = .{ .ctrl = true, .shift = true } },
                 .{ .new_split = .down },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .left_bracket }, .mods = .{ .ctrl = true, .super = true } },
+                .{ .key = .{ .physical = .bracket_left }, .mods = .{ .ctrl = true, .super = true } },
                 .{ .goto_split = .previous },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .right_bracket }, .mods = .{ .ctrl = true, .super = true } },
+                .{ .key = .{ .physical = .bracket_right }, .mods = .{ .ctrl = true, .super = true } },
                 .{ .goto_split = .next },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .up }, .mods = .{ .ctrl = true, .alt = true } },
+                .{ .key = .{ .physical = .arrow_up }, .mods = .{ .ctrl = true, .alt = true } },
                 .{ .goto_split = .up },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .down }, .mods = .{ .ctrl = true, .alt = true } },
+                .{ .key = .{ .physical = .arrow_down }, .mods = .{ .ctrl = true, .alt = true } },
                 .{ .goto_split = .down },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .left }, .mods = .{ .ctrl = true, .alt = true } },
+                .{ .key = .{ .physical = .arrow_left }, .mods = .{ .ctrl = true, .alt = true } },
                 .{ .goto_split = .left },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .right }, .mods = .{ .ctrl = true, .alt = true } },
+                .{ .key = .{ .physical = .arrow_right }, .mods = .{ .ctrl = true, .alt = true } },
                 .{ .goto_split = .right },
             );
 
             // Resizing splits
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .up }, .mods = .{ .super = true, .ctrl = true, .shift = true } },
+                .{ .key = .{ .physical = .arrow_up }, .mods = .{ .super = true, .ctrl = true, .shift = true } },
                 .{ .resize_split = .{ .up, 10 } },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .down }, .mods = .{ .super = true, .ctrl = true, .shift = true } },
+                .{ .key = .{ .physical = .arrow_down }, .mods = .{ .super = true, .ctrl = true, .shift = true } },
                 .{ .resize_split = .{ .down, 10 } },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .left }, .mods = .{ .super = true, .ctrl = true, .shift = true } },
+                .{ .key = .{ .physical = .arrow_left }, .mods = .{ .super = true, .ctrl = true, .shift = true } },
                 .{ .resize_split = .{ .left, 10 } },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .right }, .mods = .{ .super = true, .ctrl = true, .shift = true } },
+                .{ .key = .{ .physical = .arrow_right }, .mods = .{ .super = true, .ctrl = true, .shift = true } },
                 .{ .resize_split = .{ .right, 10 } },
-            );
-            try self.set.put(
-                alloc,
-                .{ .key = .{ .translated = .plus }, .mods = .{ .super = true, .ctrl = true, .shift = true } },
-                .{ .equalize_splits = {} },
             );
 
             // Viewport scrolling
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .home }, .mods = .{ .shift = true } },
+                .{ .key = .{ .physical = .home }, .mods = .{ .shift = true } },
                 .{ .scroll_to_top = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .end }, .mods = .{ .shift = true } },
+                .{ .key = .{ .physical = .end }, .mods = .{ .shift = true } },
                 .{ .scroll_to_bottom = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .page_up }, .mods = .{ .shift = true } },
+                .{ .key = .{ .physical = .page_up }, .mods = .{ .shift = true } },
                 .{ .scroll_page_up = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .page_down }, .mods = .{ .shift = true } },
+                .{ .key = .{ .physical = .page_down }, .mods = .{ .shift = true } },
                 .{ .scroll_page_down = {} },
             );
 
             // Semantic prompts
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .page_up }, .mods = .{ .shift = true, .ctrl = true } },
+                .{ .key = .{ .physical = .page_up }, .mods = .{ .shift = true, .ctrl = true } },
                 .{ .jump_to_prompt = -1 },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .page_down }, .mods = .{ .shift = true, .ctrl = true } },
+                .{ .key = .{ .physical = .page_down }, .mods = .{ .shift = true, .ctrl = true } },
                 .{ .jump_to_prompt = 1 },
             );
 
             // Inspector, matching Chromium
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .i }, .mods = .{ .shift = true, .ctrl = true } },
+                .{ .key = .{ .unicode = 'i' }, .mods = .{ .shift = true, .ctrl = true } },
                 .{ .inspector = .toggle },
             );
 
             // Terminal
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .a }, .mods = .{ .shift = true, .ctrl = true } },
+                .{ .key = .{ .unicode = 'a' }, .mods = .{ .shift = true, .ctrl = true } },
                 .{ .select_all = {} },
             );
 
             // Selection clipboard paste
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .insert }, .mods = .{ .shift = true } },
+                .{ .key = .{ .physical = .insert }, .mods = .{ .shift = true } },
                 .{ .paste_from_selection = {} },
             );
         }
@@ -4601,23 +4756,14 @@ pub const Keybinds = struct {
                 .{ .alt = true };
 
             // Cmd+N for goto tab N
-            const start = @intFromEnum(inputpkg.Key.one);
-            const end = @intFromEnum(inputpkg.Key.eight);
-            var i: usize = start;
+            const start: u21 = '1';
+            const end: u21 = '8';
+            var i: u21 = start;
             while (i <= end) : (i += 1) {
                 try self.set.put(
                     alloc,
                     .{
-                        // On macOS, we use the physical key for tab changing so
-                        // that this works across all keyboard layouts. This may
-                        // want to be true on other platforms as well but this
-                        // is definitely true on macOS so we just do it here for
-                        // now (#817)
-                        .key = if (comptime builtin.target.os.tag.isDarwin())
-                            .{ .physical = @enumFromInt(i) }
-                        else
-                            .{ .translated = @enumFromInt(i) },
-
+                        .key = .{ .unicode = i },
                         .mods = mods,
                     },
                     .{ .goto_tab = (i - start) + 1 },
@@ -4626,10 +4772,7 @@ pub const Keybinds = struct {
             try self.set.put(
                 alloc,
                 .{
-                    .key = if (comptime builtin.target.os.tag.isDarwin())
-                        .{ .physical = .nine }
-                    else
-                        .{ .translated = .nine },
+                    .key = .{ .unicode = '9' },
                     .mods = mods,
                 },
                 .{ .last_tab = {} },
@@ -4639,207 +4782,214 @@ pub const Keybinds = struct {
         // Toggle fullscreen
         try self.set.put(
             alloc,
-            .{ .key = .{ .translated = .enter }, .mods = inputpkg.ctrlOrSuper(.{}) },
+            .{ .key = .{ .physical = .enter }, .mods = inputpkg.ctrlOrSuper(.{}) },
             .{ .toggle_fullscreen = {} },
         );
 
         // Toggle zoom a split
         try self.set.put(
             alloc,
-            .{ .key = .{ .translated = .enter }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true }) },
+            .{ .key = .{ .physical = .enter }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true }) },
             .{ .toggle_split_zoom = {} },
+        );
+
+        // Toggle command palette, matches VSCode
+        try self.set.put(
+            alloc,
+            .{ .key = .{ .unicode = 'p' }, .mods = inputpkg.ctrlOrSuper(.{ .shift = true }) },
+            .toggle_command_palette,
         );
 
         // Mac-specific keyboard bindings.
         if (comptime builtin.target.os.tag.isDarwin()) {
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .q }, .mods = .{ .super = true } },
+                .{ .key = .{ .unicode = 'q' }, .mods = .{ .super = true } },
                 .{ .quit = {} },
             );
             try self.set.putFlags(
                 alloc,
-                .{ .key = .{ .translated = .k }, .mods = .{ .super = true } },
+                .{ .key = .{ .unicode = 'k' }, .mods = .{ .super = true } },
                 .{ .clear_screen = {} },
                 .{ .performable = true },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .a }, .mods = .{ .super = true } },
+                .{ .key = .{ .unicode = 'a' }, .mods = .{ .super = true } },
                 .{ .select_all = {} },
             );
 
             // Viewport scrolling
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .home }, .mods = .{ .super = true } },
+                .{ .key = .{ .physical = .home }, .mods = .{ .super = true } },
                 .{ .scroll_to_top = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .end }, .mods = .{ .super = true } },
+                .{ .key = .{ .physical = .end }, .mods = .{ .super = true } },
                 .{ .scroll_to_bottom = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .page_up }, .mods = .{ .super = true } },
+                .{ .key = .{ .physical = .page_up }, .mods = .{ .super = true } },
                 .{ .scroll_page_up = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .page_down }, .mods = .{ .super = true } },
+                .{ .key = .{ .physical = .page_down }, .mods = .{ .super = true } },
                 .{ .scroll_page_down = {} },
             );
 
             // Semantic prompts
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .up }, .mods = .{ .super = true, .shift = true } },
+                .{ .key = .{ .physical = .arrow_up }, .mods = .{ .super = true, .shift = true } },
                 .{ .jump_to_prompt = -1 },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .down }, .mods = .{ .super = true, .shift = true } },
+                .{ .key = .{ .physical = .arrow_down }, .mods = .{ .super = true, .shift = true } },
                 .{ .jump_to_prompt = 1 },
             );
 
             // Mac windowing
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .n }, .mods = .{ .super = true } },
+                .{ .key = .{ .unicode = 'n' }, .mods = .{ .super = true } },
                 .{ .new_window = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .w }, .mods = .{ .super = true } },
+                .{ .key = .{ .unicode = 'w' }, .mods = .{ .super = true } },
                 .{ .close_surface = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .w }, .mods = .{ .super = true, .alt = true } },
+                .{ .key = .{ .unicode = 'w' }, .mods = .{ .super = true, .alt = true } },
                 .{ .close_tab = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .w }, .mods = .{ .super = true, .shift = true } },
+                .{ .key = .{ .unicode = 'w' }, .mods = .{ .super = true, .shift = true } },
                 .{ .close_window = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .w }, .mods = .{ .super = true, .shift = true, .alt = true } },
+                .{ .key = .{ .unicode = 'w' }, .mods = .{ .super = true, .shift = true, .alt = true } },
                 .{ .close_all_windows = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .t }, .mods = .{ .super = true } },
+                .{ .key = .{ .unicode = 't' }, .mods = .{ .super = true } },
                 .{ .new_tab = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .left_bracket }, .mods = .{ .super = true, .shift = true } },
+                .{ .key = .{ .physical = .bracket_left }, .mods = .{ .super = true, .shift = true } },
                 .{ .previous_tab = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .right_bracket }, .mods = .{ .super = true, .shift = true } },
+                .{ .key = .{ .physical = .bracket_right }, .mods = .{ .super = true, .shift = true } },
                 .{ .next_tab = {} },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .d }, .mods = .{ .super = true } },
+                .{ .key = .{ .unicode = 'd' }, .mods = .{ .super = true } },
                 .{ .new_split = .right },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .d }, .mods = .{ .super = true, .shift = true } },
+                .{ .key = .{ .unicode = 'd' }, .mods = .{ .super = true, .shift = true } },
                 .{ .new_split = .down },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .left_bracket }, .mods = .{ .super = true } },
+                .{ .key = .{ .physical = .bracket_left }, .mods = .{ .super = true } },
                 .{ .goto_split = .previous },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .right_bracket }, .mods = .{ .super = true } },
+                .{ .key = .{ .physical = .bracket_right }, .mods = .{ .super = true } },
                 .{ .goto_split = .next },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .up }, .mods = .{ .super = true, .alt = true } },
+                .{ .key = .{ .physical = .arrow_up }, .mods = .{ .super = true, .alt = true } },
                 .{ .goto_split = .up },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .down }, .mods = .{ .super = true, .alt = true } },
+                .{ .key = .{ .physical = .arrow_down }, .mods = .{ .super = true, .alt = true } },
                 .{ .goto_split = .down },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .left }, .mods = .{ .super = true, .alt = true } },
+                .{ .key = .{ .physical = .arrow_left }, .mods = .{ .super = true, .alt = true } },
                 .{ .goto_split = .left },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .right }, .mods = .{ .super = true, .alt = true } },
+                .{ .key = .{ .physical = .arrow_right }, .mods = .{ .super = true, .alt = true } },
                 .{ .goto_split = .right },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .up }, .mods = .{ .super = true, .ctrl = true } },
+                .{ .key = .{ .physical = .arrow_up }, .mods = .{ .super = true, .ctrl = true } },
                 .{ .resize_split = .{ .up, 10 } },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .down }, .mods = .{ .super = true, .ctrl = true } },
+                .{ .key = .{ .physical = .arrow_down }, .mods = .{ .super = true, .ctrl = true } },
                 .{ .resize_split = .{ .down, 10 } },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .left }, .mods = .{ .super = true, .ctrl = true } },
+                .{ .key = .{ .physical = .arrow_left }, .mods = .{ .super = true, .ctrl = true } },
                 .{ .resize_split = .{ .left, 10 } },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .right }, .mods = .{ .super = true, .ctrl = true } },
+                .{ .key = .{ .physical = .arrow_right }, .mods = .{ .super = true, .ctrl = true } },
                 .{ .resize_split = .{ .right, 10 } },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .equal }, .mods = .{ .super = true, .ctrl = true } },
+                .{ .key = .{ .physical = .equal }, .mods = .{ .super = true, .ctrl = true } },
                 .{ .equalize_splits = {} },
             );
 
             // Jump to prompt, matches Terminal.app
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .up }, .mods = .{ .super = true } },
+                .{ .key = .{ .physical = .arrow_up }, .mods = .{ .super = true } },
                 .{ .jump_to_prompt = -1 },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .down }, .mods = .{ .super = true } },
+                .{ .key = .{ .physical = .arrow_down }, .mods = .{ .super = true } },
                 .{ .jump_to_prompt = 1 },
             );
 
             // Inspector, matching Chromium
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .i }, .mods = .{ .alt = true, .super = true } },
+                .{ .key = .{ .unicode = 'i' }, .mods = .{ .alt = true, .super = true } },
                 .{ .inspector = .toggle },
             );
 
             // Alternate keybind, common to Mac programs
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .f }, .mods = .{ .super = true, .ctrl = true } },
+                .{ .key = .{ .unicode = 'f' }, .mods = .{ .super = true, .ctrl = true } },
                 .{ .toggle_fullscreen = {} },
             );
 
             // Selection clipboard paste, matches Terminal.app
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .v }, .mods = .{ .super = true, .shift = true } },
+                .{ .key = .{ .unicode = 'v' }, .mods = .{ .super = true, .shift = true } },
                 .{ .paste_from_selection = {} },
             );
 
@@ -4850,27 +5000,27 @@ pub const Keybinds = struct {
             // the keybinds to `unbind`.
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .right }, .mods = .{ .super = true } },
+                .{ .key = .{ .physical = .arrow_right }, .mods = .{ .super = true } },
                 .{ .text = "\\x05" },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .left }, .mods = .{ .super = true } },
+                .{ .key = .{ .physical = .arrow_left }, .mods = .{ .super = true } },
                 .{ .text = "\\x01" },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .backspace }, .mods = .{ .super = true } },
+                .{ .key = .{ .physical = .backspace }, .mods = .{ .super = true } },
                 .{ .text = "\\x15" },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .left }, .mods = .{ .alt = true } },
+                .{ .key = .{ .physical = .arrow_left }, .mods = .{ .alt = true } },
                 .{ .esc = "b" },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .translated = .right }, .mods = .{ .alt = true } },
+                .{ .key = .{ .physical = .arrow_right }, .mods = .{ .alt = true } },
                 .{ .esc = "f" },
             );
         }
@@ -5057,8 +5207,8 @@ pub const Keybinds = struct {
         // Note they turn into translated keys because they match
         // their ASCII mapping.
         const want =
-            \\keybind = ctrl+z>two=goto_tab:2
-            \\keybind = ctrl+z>one=goto_tab:1
+            \\keybind = ctrl+z>2=goto_tab:2
+            \\keybind = ctrl+z>1=goto_tab:1
             \\
         ;
         try std.testing.expectEqualStrings(want, buf.items);
@@ -5082,9 +5232,9 @@ pub const Keybinds = struct {
 
         // NB: This does not currently retain the order of the keybinds.
         const want =
+            \\a = ctrl+a>ctrl+c>t=new_tab
             \\a = ctrl+a>ctrl+b>w=close_window
             \\a = ctrl+a>ctrl+b>n=new_window
-            \\a = ctrl+a>ctrl+c>t=new_tab
             \\a = ctrl+b>ctrl+d>a=previous_tab
             \\
         ;
@@ -5667,6 +5817,12 @@ pub const GtkToolbarStyle = enum {
 /// See app-notifications
 pub const AppNotifications = packed struct {
     @"clipboard-copy": bool = true,
+};
+
+/// See bell-features
+pub const BellFeatures = packed struct {
+    system: bool = false,
+    audio: bool = false,
 };
 
 /// See mouse-shift-capture
@@ -6620,7 +6776,11 @@ test "parse e: command only" {
 
     var it: TestIterator = .{ .data = &.{"foo"} };
     try testing.expect(!try cfg.parseManuallyHook(alloc, "-e", &it));
-    try testing.expectEqualStrings("foo", cfg.@"initial-command".?);
+
+    const cmd = cfg.@"initial-command".?;
+    try testing.expect(cmd == .direct);
+    try testing.expectEqual(cmd.direct.len, 1);
+    try testing.expectEqualStrings(cmd.direct[0], "foo");
 }
 
 test "parse e: command and args" {
@@ -6631,7 +6791,13 @@ test "parse e: command and args" {
 
     var it: TestIterator = .{ .data = &.{ "echo", "foo", "bar baz" } };
     try testing.expect(!try cfg.parseManuallyHook(alloc, "-e", &it));
-    try testing.expectEqualStrings("echo foo bar baz", cfg.@"initial-command".?);
+
+    const cmd = cfg.@"initial-command".?;
+    try testing.expect(cmd == .direct);
+    try testing.expectEqual(cmd.direct.len, 3);
+    try testing.expectEqualStrings(cmd.direct[0], "echo");
+    try testing.expectEqualStrings(cmd.direct[1], "foo");
+    try testing.expectEqualStrings(cmd.direct[2], "bar baz");
 }
 
 test "clone default" {

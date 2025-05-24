@@ -40,6 +40,7 @@ const Window = @import("Window.zig");
 const ConfigErrorsDialog = @import("ConfigErrorsDialog.zig");
 const ClipboardConfirmationWindow = @import("ClipboardConfirmationWindow.zig");
 const CloseDialog = @import("CloseDialog.zig");
+const GlobalShortcuts = @import("GlobalShortcuts.zig");
 const Split = @import("Split.zig");
 const inspector = @import("inspector.zig");
 const key = @import("key.zig");
@@ -74,6 +75,9 @@ cursor_none: ?*gdk.Cursor,
 /// The clipboard confirmation window, if it is currently open.
 clipboard_confirmation_window: ?*ClipboardConfirmationWindow = null,
 
+/// The config errors dialog, if it is currently open.
+config_errors_dialog: ?ConfigErrorsDialog = null,
+
 /// The window containing the quick terminal.
 /// Null when never initialized.
 quick_terminal: ?*Window = null,
@@ -91,6 +95,8 @@ css_provider: *gtk.CssProvider,
 
 /// Providers for loading custom stylesheets defined by user
 custom_css_providers: std.ArrayListUnmanaged(*gtk.CssProvider) = .{},
+
+global_shortcuts: ?GlobalShortcuts,
 
 /// The timer used to quit the application after the last window is closed.
 quit_timer: union(enum) {
@@ -159,6 +165,7 @@ pub fn init(core_app: *CoreApp, opts: Options) !App {
         opengl: bool = false,
         /// disable GLES, Ghostty can't use GLES
         @"gl-disable-gles": bool = false,
+        // GTK's new renderer can cause blurry font when using fractional scaling.
         @"gl-no-fractional": bool = false,
         /// Disabling Vulkan can improve startup times by hundreds of
         /// milliseconds on some systems. We don't use Vulkan so we can just
@@ -190,7 +197,6 @@ pub fn init(core_app: *CoreApp, opts: Options) !App {
             // For the remainder of "why" see the 4.14 comment below.
             gdk_disable.@"gles-api" = true;
             gdk_disable.vulkan = true;
-            gdk_debug.@"gl-no-fractional" = true;
             break :environment;
         }
         if (gtk_version.runtimeAtLeast(4, 14, 0)) {
@@ -201,8 +207,12 @@ pub fn init(core_app: *CoreApp, opts: Options) !App {
             //
             // Upstream issue: https://gitlab.gnome.org/GNOME/gtk/-/issues/6589
             gdk_debug.@"gl-disable-gles" = true;
-            gdk_debug.@"gl-no-fractional" = true;
             gdk_debug.@"vulkan-disable" = true;
+
+            if (gtk_version.runtimeUntil(4, 17, 5)) {
+                // Removed at GTK v4.17.5
+                gdk_debug.@"gl-no-fractional" = true;
+            }
             break :environment;
         }
         // Versions prior to 4.14 are a bit of an unknown for Ghostty. It
@@ -415,6 +425,7 @@ pub fn init(core_app: *CoreApp, opts: Options) !App {
         // our "activate" call above will open a window.
         .running = gio_app.getIsRemote() == 0,
         .css_provider = css_provider,
+        .global_shortcuts = .init(core_app.alloc, gio_app),
     };
 }
 
@@ -435,6 +446,8 @@ pub fn terminate(self: *App) void {
     self.custom_css_providers.deinit(self.core_app.alloc);
 
     self.winproto.deinit(self.core_app.alloc);
+
+    if (self.global_shortcuts) |*shortcuts| shortcuts.deinit();
 
     self.config.deinit();
 }
@@ -484,9 +497,12 @@ pub fn performAction(
         .prompt_title => try self.promptTitle(target),
         .toggle_quick_terminal => return try self.toggleQuickTerminal(),
         .secure_input => self.setSecureInput(target, value),
+        .ring_bell => try self.ringBell(target),
+        .toggle_command_palette => try self.toggleCommandPalette(target),
 
         // Unimplemented
         .close_all_windows,
+        .float_window,
         .toggle_visibility,
         .cell_size,
         .key_sequence,
@@ -494,6 +510,7 @@ pub fn performAction(
         .renderer_health,
         .color_change,
         .reset_window_size,
+        .check_for_updates,
         => {
             log.warn("unimplemented action={}", .{action});
             return false;
@@ -740,7 +757,7 @@ fn toggleWindowDecorations(
         .surface => |v| {
             const window = v.rt_surface.container.window() orelse {
                 log.info(
-                    "toggleFullscreen invalid for container={s}",
+                    "toggleWindowDecorations invalid for container={s}",
                     .{@tagName(v.rt_surface.container)},
                 );
                 return;
@@ -773,6 +790,30 @@ fn toggleQuickTerminal(self: *App) !bool {
     try qt.newTab(null);
     qt.present();
     return true;
+}
+
+fn ringBell(_: *App, target: apprt.Target) !void {
+    switch (target) {
+        .app => {},
+        .surface => |surface| try surface.rt_surface.ringBell(),
+    }
+}
+
+fn toggleCommandPalette(_: *App, target: apprt.Target) !void {
+    switch (target) {
+        .app => {},
+        .surface => |surface| {
+            const window = surface.rt_surface.container.window() orelse {
+                log.info(
+                    "toggleCommandPalette invalid for container={s}",
+                    .{@tagName(surface.rt_surface.container)},
+                );
+                return;
+            };
+
+            window.toggleCommandPalette();
+        },
+    }
 }
 
 fn quitTimer(self: *App, mode: apprt.action.QuitTimer) void {
@@ -995,6 +1036,12 @@ fn syncConfigChanges(self: *App, window: ?*Window) !void {
     ConfigErrorsDialog.maybePresent(self, window);
     try self.syncActionAccelerators();
 
+    if (self.global_shortcuts) |*shortcuts| {
+        shortcuts.refreshSession(self) catch |err| {
+            log.warn("failed to refresh global shortcuts={}", .{err});
+        };
+    }
+
     // Load our runtime and custom CSS. If this fails then our window is just stuck
     // with the old CSS but we don't want to fail the entire sync operation.
     self.loadRuntimeCss() catch |err| switch (err) {
@@ -1013,6 +1060,7 @@ fn syncActionAccelerators(self: *App) !void {
     try self.syncActionAccelerator("app.open-config", .{ .open_config = {} });
     try self.syncActionAccelerator("app.reload-config", .{ .reload_config = {} });
     try self.syncActionAccelerator("win.toggle-inspector", .{ .inspector = .toggle });
+    try self.syncActionAccelerator("win.toggle-command-palette", .toggle_command_palette);
     try self.syncActionAccelerator("win.close", .{ .close_window = {} });
     try self.syncActionAccelerator("win.new-window", .{ .new_window = {} });
     try self.syncActionAccelerator("win.new-tab", .{ .new_tab = {} });
@@ -1282,6 +1330,13 @@ pub fn run(self: *App) !void {
     // Setup our actions
     self.initActions();
 
+    // On startup, we want to check for configuration errors right away
+    // so we can show our error window. We also need to setup other initial
+    // state.
+    self.syncConfigChanges(null) catch |err| {
+        log.warn("error handling configuration changes err={}", .{err});
+    };
+
     while (self.running) {
         _ = glib.MainContext.iteration(self.ctx, 1);
 
@@ -1506,7 +1561,7 @@ fn adwNotifyDark(
     style_manager: *adw.StyleManager,
     _: *gobject.ParamSpec,
     self: *App,
-) callconv(.C) void {
+) callconv(.c) void {
     const color_scheme: apprt.ColorScheme = if (style_manager.getDark() == 0)
         .light
     else
