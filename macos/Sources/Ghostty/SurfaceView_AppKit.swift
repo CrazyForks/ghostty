@@ -43,7 +43,7 @@ extension Ghostty {
         @Published var hoverUrl: String? = nil
 
         // The currently active key sequence. The sequence is not active if this is empty.
-        @Published var keySequence: [Ghostty.KeyEquivalent] = []
+        @Published var keySequence: [KeyboardShortcut] = []
 
         // The time this surface last became focused. This is a ContinuousClock.Instant
         // on supported platforms.
@@ -62,6 +62,9 @@ extension Ghostty {
         /// The background color within the color palette of the surface. This is only set if it is
         /// dynamically updated. Otherwise, the background color is the default background color.
         @Published private(set) var backgroundColor: Color? = nil
+
+        /// True when the bell is active. This is set inactive on focus or event.
+        @Published private(set) var bell: Bool = false
 
         // An initial size to request for a window. This will only affect
         // then the view is moved to a new window.
@@ -192,6 +195,11 @@ extension Ghostty {
                 object: self)
             center.addObserver(
                 self,
+                selector: #selector(ghosttyBellDidRing(_:)),
+                name: .ghosttyBellDidRing,
+                object: self)
+            center.addObserver(
+                self,
                 selector: #selector(windowDidChangeScreen),
                 name: NSWindow.didChangeScreenNotification,
                 object: nil)
@@ -300,9 +308,12 @@ extension Ghostty {
                 SecureInput.shared.setScoped(ObjectIdentifier(self), focused: focused)
             }
 
-            // On macOS 13+ we can store our continuous clock...
             if (focused) {
+                // On macOS 13+ we can store our continuous clock...
                 focusInstant = ContinuousClock.now
+
+                // We unset our bell state if we gained focus
+                bell = false
             }
         }
 
@@ -515,7 +526,7 @@ extension Ghostty {
 
         @objc private func ghosttyDidContinueKeySequence(notification: SwiftUI.Notification) {
             guard let keyAny = notification.userInfo?[Ghostty.Notification.KeySequenceKey] else { return }
-            guard let key = keyAny as? Ghostty.KeyEquivalent else { return }
+            guard let key = keyAny as? KeyboardShortcut else { return }
             DispatchQueue.main.async { [weak self] in
                 self?.keySequence.append(key)
             }
@@ -554,6 +565,11 @@ extension Ghostty {
                 // We don't do anything for the other colors yet.
                 break
             }
+        }
+
+        @objc private func ghosttyBellDidRing(_ notification: SwiftUI.Notification) {
+            // Bell state goes to true
+            bell = true
         }
 
         @objc private func windowDidChangeScreen(notification: SwiftUI.Notification) {
@@ -743,6 +759,13 @@ extension Ghostty {
         override func mouseExited(with event: NSEvent) {
             guard let surface = self.surface else { return }
 
+            // If the mouse is being dragged then we don't have to emit
+            // this because we get mouse drag events even if we've already
+            // exited the viewport (i.e. mouseDragged)
+            if NSEvent.pressedMouseButtons != 0 {
+                return
+            }
+
             // Negative values indicate cursor has left the viewport
             let mods = Ghostty.ghosttyMods(event.modifierFlags)
             ghostty_surface_mouse_pos(surface, -1, -1, mods)
@@ -848,6 +871,9 @@ extension Ghostty {
                 return
             }
 
+            // On any keyDown event we unset our bell state
+            bell = false
+
             // We need to translate the mods (maybe) to handle configs such as option-as-alt
             let translationModsGhostty = Ghostty.eventModifierFlags(
                 mods: ghostty_surface_key_translation_mods(
@@ -925,29 +951,39 @@ extension Ghostty {
                 return
             }
 
-            // If we have text, then we've composed a character, send that down. We do this
-            // first because if we completed a preedit, the text will be available here
-            // AND we'll have a preedit.
-            var handled: Bool = false
+            // If we have marked text, we're in a preedit state. The order we
+            // do this and the key event callbacks below doesn't matter since
+            // we control the preedit state only through the preedit API.
+            syncPreedit(clearIfNeeded: markedTextBefore)
+
             if let list = keyTextAccumulator, list.count > 0 {
-                handled = true
+                // If we have text, then we've composed a character, send that down.
+                // These never have "composing" set to true because these are the
+                // result of a composition.
                 for text in list {
-                    _ = keyAction(action, event: event, text: text)
+                    _ = keyAction(
+                        action,
+                        event: event,
+                        translationEvent: translationEvent,
+                        text: text
+                    )
                 }
-            }
+            } else {
+                // We have no accumulated text so this is a normal key event.
+                _ = keyAction(
+                    action,
+                    event: event,
+                    translationEvent: translationEvent,
+                    text: translationEvent.ghosttyCharacters,
 
-            // If we have marked text, we're in a preedit state. Send that down.
-            // If we don't have marked text but we had marked text before, then the preedit
-            // was cleared so we want to send down an empty string to ensure we've cleared
-            // the preedit.
-            if (markedText.length > 0 || markedTextBefore) {
-                handled = true
-                _ = keyAction(action, event: event, preedit: markedText.string)
-            }
-
-            if (!handled) {
-                // No text or anything, we want to handle this manually.
-                _ = keyAction(action, event: event)
+                    // We're composing if we have preedit (the obvious case). But we're also
+                    // composing if we don't have preedit and we had marked text before,
+                    // because this input probably just reset the preedit state. It shouldn't
+                    // be encoded. Example: Japanese begin composing, the press backspace.
+                    // This should only cancel the composing state but not actually delete
+                    // the prior input characters (prior to the composing).
+                    composing: markedText.length > 0 || markedTextBefore
+                )
             }
         }
 
@@ -1007,16 +1043,29 @@ extension Ghostty {
             }
 
             // If this event as-is would result in a key binding then we send it.
-            if let surface,
-               ghostty_surface_key_is_binding(
-                  surface,
-                  event.ghosttyKeyEvent(GHOSTTY_ACTION_PRESS)) {
-                self.keyDown(with: event)
-                return true
+            if let surface {
+                var ghosttyEvent = event.ghosttyKeyEvent(GHOSTTY_ACTION_PRESS)
+                let match = (event.characters ?? "").withCString { ptr in
+                    ghosttyEvent.text = ptr
+                    return ghostty_surface_key_is_binding(surface, ghosttyEvent)
+                }
+                if match {
+                    self.keyDown(with: event)
+                    return true
+                }
             }
 
             let equivalent: String
             switch (event.charactersIgnoringModifiers) {
+            case "\r":
+                // Pass C-<return> through verbatim
+                // (prevent the default context menu equivalent)
+                if (!event.modifierFlags.contains(.control)) {
+                    return false
+                }
+
+                equivalent = "\r"
+
             case "/":
                 // Treat C-/ as C-_. We do this because C-/ makes macOS make a beep
                 // sound and we don't like the beep sound.
@@ -1026,15 +1075,6 @@ extension Ghostty {
                 }
 
                 equivalent = "_"
-
-            case "\r":
-                // Pass C-<return> through verbatim
-                // (prevent the default context menu equivalent)
-                if (!event.modifierFlags.contains(.control)) {
-                    return false
-                }
-
-                equivalent = "\r"
 
             default:
                 // It looks like some part of AppKit sometimes generates synthetic NSEvents
@@ -1139,34 +1179,28 @@ extension Ghostty {
             _ = keyAction(action, event: event)
         }
 
-        private func keyAction(_ action: ghostty_input_action_e, event: NSEvent) -> Bool {
-            guard let surface = self.surface else { return false }
-            return ghostty_surface_key(surface, event.ghosttyKeyEvent(action))
-        }
-
         private func keyAction(
             _ action: ghostty_input_action_e,
-            event: NSEvent, preedit: String
+            event: NSEvent,
+            translationEvent: NSEvent? = nil,
+            text: String? = nil,
+            composing: Bool = false
         ) -> Bool {
             guard let surface = self.surface else { return false }
 
-            return preedit.withCString { ptr in
-                var key_ev = event.ghosttyKeyEvent(action)
-                key_ev.text = ptr
-                key_ev.composing = true
-                return ghostty_surface_key(surface, key_ev)
-            }
-        }
+            var key_ev = event.ghosttyKeyEvent(action, translationMods: translationEvent?.modifierFlags)
+            key_ev.composing = composing
 
-        private func keyAction(
-            _ action: ghostty_input_action_e,
-            event: NSEvent, text: String
-        ) -> Bool {
-            guard let surface = self.surface else { return false }
-
-            return text.withCString { ptr in
-                var key_ev = event.ghosttyKeyEvent(action)
-                key_ev.text = ptr
+            // For text, we only encode UTF8 if we don't have a single control
+            // character. Control characters are encoded by Ghostty itself.
+            // Without this, `ctrl+enter` does the wrong thing.
+            if let text, text.count > 0,
+               let codepoint = text.utf8.first, codepoint >= 0x20 {
+                return text.withCString { ptr in
+                    key_ev.text = ptr
+                    return ghostty_surface_key(surface, key_ev)
+                }
+            } else {
                 return ghostty_surface_key(surface, key_ev)
             }
         }
@@ -1442,10 +1476,21 @@ extension Ghostty.SurfaceView: NSTextInputClient {
         default:
             print("unknown marked text: \(string)")
         }
+
+        // If we're not in a keyDown event, then we want to update our preedit
+        // text immediately. This can happen due to external events, for example
+        // changing keyboard layouts while composing: (1) set US intl (2) type '
+        // to enter dead key state (3)
+        if keyTextAccumulator == nil {
+            syncPreedit()
+        }
     }
 
     func unmarkText() {
-        self.markedText.mutableString.setString("")
+        if self.markedText.length > 0 {
+            self.markedText.mutableString.setString("")
+            syncPreedit()
+        }
     }
 
     func validAttributesForMarkedText() -> [NSAttributedString.Key] {
@@ -1583,6 +1628,26 @@ extension Ghostty.SurfaceView: NSTextInputClient {
         }
 
         print("SEL: \(selector)")
+    }
+
+    /// Sync the preedit state based on the markedText value to libghostty
+    private func syncPreedit(clearIfNeeded: Bool = true) {
+        guard let surface else { return }
+
+        if markedText.length > 0 {
+            let str = markedText.string
+            let len = str.utf8CString.count
+            if len > 0 {
+                markedText.string.withCString { ptr in
+                    // Subtract 1 for the null terminator
+                    ghostty_surface_preedit(surface, ptr, UInt(len - 1))
+                }
+            }
+        } else if clearIfNeeded {
+            // If we had marked text before but don't now, we're no longer
+            // in a preedit state so we can clear it.
+            ghostty_surface_preedit(surface, nil, 0)
+        }
     }
 }
 

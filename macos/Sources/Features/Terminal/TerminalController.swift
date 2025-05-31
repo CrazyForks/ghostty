@@ -87,12 +87,6 @@ class TerminalController: BaseTerminalController {
             object: nil)
         center.addObserver(
             self,
-            selector: #selector(onEqualizeSplits),
-            name: Ghostty.Notification.didEqualizeSplits,
-            object: nil
-        )
-        center.addObserver(
-            self,
             selector: #selector(onCloseWindow),
             name: .ghosttyCloseWindow,
             object: nil
@@ -121,9 +115,7 @@ class TerminalController: BaseTerminalController {
     }
 
 
-    override func fullscreenDidChange() {
-        super.fullscreenDidChange()
-
+    func fullscreenDidChange() {
         // When our fullscreen state changes, we resync our appearance because some
         // properties change when fullscreen or not.
         guard let focusedSurface else { return }
@@ -192,7 +184,7 @@ class TerminalController: BaseTerminalController {
             }
 
             let action = "goto_tab:\(tab)"
-            if let equiv = ghostty.config.keyEquivalent(for: action) {
+            if let equiv = ghostty.config.keyboardShortcut(for: action) {
                 window.keyEquivalent = "\(equiv)"
             } else {
                 window.keyEquivalent = ""
@@ -877,16 +869,6 @@ class TerminalController: BaseTerminalController {
         toggleFullscreen(mode: fullscreenMode)
     }
 
-    @objc private func onEqualizeSplits(_ notification: Notification) {
-        guard let target = notification.object as? Ghostty.SurfaceView else { return }
-
-        // Check if target surface is in current controller's tree
-        guard surfaceTree?.contains(view: target) ?? false else { return }
-
-        if case .split(let container) = surfaceTree {
-            _ = container.equalize()
-        }
-    }
 
     struct DerivedConfig {
         let backgroundColor: Color

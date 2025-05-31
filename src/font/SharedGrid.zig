@@ -319,7 +319,7 @@ fn testGrid(mode: TestMode, alloc: Allocator, lib: Library) !SharedGrid {
 
     switch (mode) {
         .normal => {
-            _ = try c.add(alloc, .regular, .{ .loaded = try Face.init(
+            _ = try c.add(alloc, .regular, .{ .loaded = try .init(
                 lib,
                 testFont,
                 .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
@@ -338,7 +338,7 @@ test getIndex {
     const alloc = testing.allocator;
     // const testEmoji = @import("test.zig").fontEmoji;
 
-    var lib = try Library.init();
+    var lib = try Library.init(alloc);
     defer lib.deinit();
 
     var grid = try testGrid(.normal, alloc, lib);

@@ -1,5 +1,6 @@
 import Cocoa
 import SwiftUI
+import Combine
 import GhosttyKit
 
 /// A base class for windows that can contain Ghostty windows. This base class implements
@@ -45,6 +46,9 @@ class BaseTerminalController: NSWindowController,
         didSet { surfaceTreeDidChange(from: oldValue, to: surfaceTree) }
     }
 
+    /// This can be set to show/hide the command palette.
+    @Published var commandPaletteIsShowing: Bool = false
+
     /// Whether the terminal surface should focus when the mouse is over it.
     var focusFollowsMouse: Bool {
         self.derivedConfig.focusFollowsMouse
@@ -67,6 +71,9 @@ class BaseTerminalController: NSWindowController,
 
     /// The configuration derived from the Ghostty config so we don't need to rely on references.
     private var derivedConfig: DerivedConfig
+
+    /// The cancellables related to our focused surface.
+    private var focusedSurfaceCancellables: Set<AnyCancellable> = []
 
     struct SavedFrame {
         let window: NSRect
@@ -107,6 +114,21 @@ class BaseTerminalController: NSWindowController,
             selector: #selector(ghosttyConfigDidChangeBase(_:)),
             name: .ghosttyConfigDidChange,
             object: nil)
+        center.addObserver(
+            self,
+            selector: #selector(ghosttyCommandPaletteDidToggle(_:)),
+            name: .ghosttyCommandPaletteDidToggle,
+            object: nil)
+        center.addObserver(
+            self,
+            selector: #selector(ghosttyMaximizeDidToggle(_:)),
+            name: .ghosttyMaximizeDidToggle,
+            object: nil)
+        center.addObserver(
+            self,
+            selector: #selector(ghosttyDidEqualizeSplits(_:)),
+            name: Ghostty.Notification.didEqualizeSplits,
+            object: nil)
 
         // Listen for local events that we need to know of outside of
         // single surface handlers.
@@ -144,6 +166,7 @@ class BaseTerminalController: NSWindowController,
             // Our focus state requires that this window is key and our currently
             // focused surface is the surface in this leaf.
             let focused: Bool = (window?.isKeyWindow ?? false) &&
+                !commandPaletteIsShowing &&
                 focusedSurface != nil &&
                 leaf.surface == focusedSurface!
             leaf.surface.focusDidChange(focused)
@@ -209,14 +232,38 @@ class BaseTerminalController: NSWindowController,
         // We only care if the configuration is a global configuration, not a
         // surface-specific one.
         guard notification.object == nil else { return }
-        
+
         // Get our managed configuration object out
         guard let config = notification.userInfo?[
             Notification.Name.GhosttyConfigChangeKey
         ] as? Ghostty.Config else { return }
-        
+
         // Update our derived config
         self.derivedConfig = DerivedConfig(config)
+    }
+
+    @objc private func ghosttyCommandPaletteDidToggle(_ notification: Notification) {
+        guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
+        guard surfaceTree?.contains(view: surfaceView) ?? false else { return }
+        toggleCommandPalette(nil)
+    }
+
+    @objc private func ghosttyMaximizeDidToggle(_ notification: Notification) {
+        guard let window else { return }
+        guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
+        guard surfaceTree?.contains(view: surfaceView) ?? false else { return }
+        window.zoom(nil)
+    }
+    
+    @objc private func ghosttyDidEqualizeSplits(_ notification: Notification) {
+        guard let target = notification.object as? Ghostty.SurfaceView else { return }
+        
+        // Check if target surface is in current controller's tree
+        guard surfaceTree?.contains(view: target) ?? false else { return }
+        
+        if case .split(let container) = surfaceTree {
+            _ = container.equalize()
+        }
     }
 
     // MARK: Local Events
@@ -259,7 +306,26 @@ class BaseTerminalController: NSWindowController,
     func surfaceTreeDidChange() {}
 
     func focusedSurfaceDidChange(to: Ghostty.SurfaceView?) {
+        let lastFocusedSurface = focusedSurface
         focusedSurface = to
+
+        // Important to cancel any prior subscriptions
+        focusedSurfaceCancellables = []
+
+        // Setup our title listener. If we have a focused surface we always use that.
+        // Otherwise, we try to use our last focused surface. In either case, we only
+        // want to care if the surface is in the tree so we don't listen to titles of
+        // closed surfaces.
+        if let titleSurface = focusedSurface ?? lastFocusedSurface,
+           surfaceTree?.contains(view: titleSurface) ?? false {
+            // If we have a surface, we want to listen for title changes.
+            titleSurface.$title
+                .sink { [weak self] in self?.titleDidChange(to: $0) }
+                .store(in: &focusedSurfaceCancellables)
+        } else {
+            // There is no surface to listen to titles for.
+            titleDidChange(to: "👻")
+        }
     }
 
     func titleDidChange(to: String) {
@@ -287,6 +353,15 @@ class BaseTerminalController: NSWindowController,
     }
 
     func zoomStateDidChange(to: Bool) {}
+
+    func performAction(_ action: String, on surfaceView: Ghostty.SurfaceView) {
+        guard let surface = surfaceView.surface else { return }
+        let len = action.utf8CString.count
+        if (len == 0) { return }
+        _ = action.withCString { cString in
+            ghostty_surface_binding_action(surface, cString, UInt(len - 1))
+        }
+    }
 
     // MARK: Fullscreen
 
@@ -334,14 +409,6 @@ class BaseTerminalController: NSWindowController,
             fullscreenStyle.exit()
         } else {
             fullscreenStyle.enter()
-        }
-    }
-
-    func fullscreenDidChange() {
-        // For some reason focus can get lost when we change fullscreen. Regardless of
-        // mode above we just move it back.
-        if let focusedSurface {
-            Ghostty.moveFocus(to: focusedSurface)
         }
     }
 
@@ -617,6 +684,10 @@ class BaseTerminalController: NSWindowController,
     @IBAction func resetFontSize(_ sender: Any) {
         guard let surface = focusedSurface?.surface else { return }
         ghostty.changeFontSize(surface: surface, .reset)
+    }
+
+    @IBAction func toggleCommandPalette(_ sender: Any?) {
+        commandPaletteIsShowing.toggle()
     }
 
     @objc func resetTerminal(_ sender: Any) {
