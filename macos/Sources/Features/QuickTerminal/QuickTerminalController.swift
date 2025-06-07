@@ -3,12 +3,6 @@ import Cocoa
 import SwiftUI
 import GhosttyKit
 
-// This is a Apple's private function that we need to call to get the active space.
-@_silgen_name("CGSGetActiveSpace")
-func CGSGetActiveSpace(_ cid: Int) -> size_t
-@_silgen_name("CGSMainConnectionID")
-func CGSMainConnectionID() -> Int
-
 /// Controller for the "quick" terminal.
 class QuickTerminalController: BaseTerminalController {
     override var windowNibName: NSNib.Name? { "QuickTerminal" }
@@ -25,7 +19,7 @@ class QuickTerminalController: BaseTerminalController {
     private var previousApp: NSRunningApplication? = nil
 
     // The active space when the quick terminal was last shown.
-    private var previousActiveSpace: size_t = 0
+    private var previousActiveSpace: CGSSpace? = nil
 
     /// Non-nil if we have hidden dock state.
     private var hiddenDock: HiddenDock? = nil
@@ -36,7 +30,7 @@ class QuickTerminalController: BaseTerminalController {
     init(_ ghostty: Ghostty.App,
          position: QuickTerminalPosition = .top,
          baseConfig base: Ghostty.SurfaceConfiguration? = nil,
-         surfaceTree tree: Ghostty.SplitNode? = nil
+         surfaceTree tree: SplitTree<Ghostty.SurfaceView>? = nil
     ) {
         self.position = position
         self.derivedConfig = DerivedConfig(ghostty.config)
@@ -51,7 +45,7 @@ class QuickTerminalController: BaseTerminalController {
             object: nil)
         center.addObserver(
             self,
-            selector: #selector(onToggleFullscreen),
+            selector: #selector(onToggleFullscreen(notification:)),
             name: Ghostty.Notification.ghosttyToggleFullscreen,
             object: nil)
         center.addObserver(
@@ -154,14 +148,24 @@ class QuickTerminalController: BaseTerminalController {
                 animateOut()
 
             case .move:
-                let currentActiveSpace = CGSGetActiveSpace(CGSMainConnectionID())
+                let currentActiveSpace = CGSSpace.active()
                 if previousActiveSpace == currentActiveSpace {
                     // We haven't moved spaces. We lost focus to another app on the
                     // current space. Animate out.
                     animateOut()
                 } else {
-                    // We've moved to a different space. Bring the quick terminal back
-                    // into view.
+                    // We've moved to a different space.
+
+                    // If we're fullscreen, we need to exit fullscreen because the visible
+                    // bounds may have changed causing a new behavior.
+                    if let fullscreenStyle, fullscreenStyle.isFullscreen {
+                        fullscreenStyle.exit()
+                        DispatchQueue.main.async {
+                            self.onToggleFullscreen()
+                        }
+                    }
+
+                    // Make the window visible again on this space
                     DispatchQueue.main.async {
                         self.window?.makeKeyAndOrderFront(nil)
                     }
@@ -181,11 +185,11 @@ class QuickTerminalController: BaseTerminalController {
 
     // MARK: Base Controller Overrides
 
-    override func surfaceTreeDidChange(from: Ghostty.SplitNode?, to: Ghostty.SplitNode?) {
+    override func surfaceTreeDidChange(from: SplitTree<Ghostty.SurfaceView>, to: SplitTree<Ghostty.SurfaceView>) {
         super.surfaceTreeDidChange(from: from, to: to)
 
         // If our surface tree is nil then we animate the window out.
-        if (to == nil) {
+        if (to.isEmpty) {
             animateOut()
         }
     }
@@ -224,18 +228,19 @@ class QuickTerminalController: BaseTerminalController {
         }
 
         // Set previous active space
-        self.previousActiveSpace = CGSGetActiveSpace(CGSMainConnectionID())
+        self.previousActiveSpace = CGSSpace.active()
 
         // Animate the window in
         animateWindowIn(window: window, from: position)
 
-        // If our surface tree is nil then we initialize a new terminal. The surface
-        // tree can be nil if for example we run "eixt" in the terminal and force
+        // If our surface tree is empty then we initialize a new terminal. The surface
+        // tree can be empty if for example we run "exit" in the terminal and force
         // animate out.
-        if (surfaceTree == nil) {
-            let leaf: Ghostty.SplitNode.Leaf = .init(ghostty.app!, baseConfig: nil)
-            surfaceTree = .leaf(leaf)
-            focusedSurface = leaf.surface
+        if surfaceTree.isEmpty,
+           let ghostty_app = ghostty.app {
+            let view = Ghostty.SurfaceView(ghostty_app, baseConfig: nil)
+            surfaceTree = SplitTree(view: view)
+            focusedSurface = view
         }
     }
 
@@ -485,9 +490,29 @@ class QuickTerminalController: BaseTerminalController {
     @objc private func onToggleFullscreen(notification: SwiftUI.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard target == self.focusedSurface else { return }
+        onToggleFullscreen()
+    }
 
-        // We ignore the requested mode and always use non-native for the quick terminal
-        toggleFullscreen(mode: .nonNative)
+    private func onToggleFullscreen() {
+        // We ignore the configured fullscreen style and always use non-native
+        // because the way the quick terminal works doesn't support native.
+        let mode: FullscreenMode
+        if (NSApp.isFrontmost) {
+            // If we're frontmost and we have a notch then we keep padding
+            // so all lines of the terminal are visible.
+            if (window?.screen?.hasNotch ?? false) {
+                mode = .nonNativePaddedNotch
+            } else {
+                mode = .nonNative
+            }
+        } else {
+            // An additional detail is that if the is NOT frontmost, then our
+            // NSApp.presentationOptions will not take effect so we must always
+            // do the visible menu mode since we can't get rid of the menu.
+            mode = .nonNativeVisibleMenu
+        }
+
+        toggleFullscreen(mode: mode)
     }
 
     @objc private func ghosttyConfigDidChange(_ notification: Notification) {
