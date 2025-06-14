@@ -74,12 +74,15 @@ pub const Message = union(enum) {
 
     /// A terminal color was changed using OSC sequences.
     color_change: struct {
-        kind: terminal.osc.Command.ColorKind,
+        kind: terminal.osc.Command.ColorOperation.Kind,
         color: terminal.color.RGB,
     },
 
     /// The terminal has reported a change in the working directory.
     pwd_change: WriteReq,
+
+    /// The terminal encountered a bell character.
+    ring_bell,
 
     pub const ReportTitleStyle = enum {
         csi_21_t,

@@ -6,14 +6,12 @@ extension Ghostty {
     /// Render a terminal for the active app in the environment.
     struct Terminal: View {
         @EnvironmentObject private var ghostty: Ghostty.App
-        @FocusedValue(\.ghosttySurfaceTitle) private var surfaceTitle: String?
 
         var body: some View {
             if let app = self.ghostty.app {
                 SurfaceForApp(app) { surfaceView in
                     SurfaceWrapper(surfaceView: surfaceView)
                 }
-                .navigationTitle(surfaceTitle ?? "Ghostty")
             }
         }
     }
@@ -59,6 +57,15 @@ extension Ghostty {
 
         @EnvironmentObject private var ghostty: Ghostty.App
 
+        var title: String {
+            var result = surfaceView.title
+            if (surfaceView.bell && ghostty.config.bellFeatures.contains(.title)) {
+                result = "🔔 \(result)"
+            }
+
+            return result
+        }
+
         var body: some View {
             let center = NotificationCenter.default
 
@@ -74,7 +81,6 @@ extension Ghostty {
 
                     Surface(view: surfaceView, size: geo.size)
                         .focused($surfaceFocus)
-                        .focusedValue(\.ghosttySurfaceTitle, surfaceView.title)
                         .focusedValue(\.ghosttySurfacePwd, surfaceView.pwd)
                         .focusedValue(\.ghosttySurfaceView, surfaceView)
                         .focusedValue(\.ghosttySurfaceCellSize, surfaceView.cellSize)
@@ -295,8 +301,12 @@ extension Ghostty {
             if let instant = focusInstant {
                 let d = instant.duration(to: ContinuousClock.now)
                 if (d < .milliseconds(500)) {
-                    // Avoid this size completely.
-                    lastSize = geoSize
+                    // Avoid this size completely. We can't set values during
+                    // view updates so we have to defer this to another tick.
+                    DispatchQueue.main.async {
+                        lastSize = geoSize
+                    }
+
                     return true;
                 }
             }
@@ -320,7 +330,7 @@ extension Ghostty {
                         Spacer()
                     }
 
-                    Text(verbatim: "\(size.columns)c ⨯ \(size.rows)r")
+                    Text(verbatim: "\(size.columns) ⨯ \(size.rows)")
                         .padding(.init(top: padding, leading: padding, bottom: padding, trailing: padding))
                         .background(
                             RoundedRectangle(cornerRadius: 4)
@@ -454,6 +464,62 @@ extension Ghostty {
             return config
         }
     }
+
+    #if canImport(AppKit)
+    /// When changing the split state, or going full screen (native or non), the terminal view
+    /// will lose focus. There has to be some nice SwiftUI-native way to fix this but I can't
+    /// figure it out so we're going to do this hacky thing to bring focus back to the terminal
+    /// that should have it.
+    static func moveFocus(
+        to: SurfaceView,
+        from: SurfaceView? = nil,
+        delay: TimeInterval? = nil
+    ) {
+        // The whole delay machinery is a bit of a hack to work around a
+        // situation where the window is destroyed and the surface view
+        // will never be attached to a window. Realistically, we should
+        // handle this upstream but we also don't want this function to be
+        // a source of infinite loops.
+
+        // Our max delay before we give up
+        let maxDelay: TimeInterval = 0.5
+        guard (delay ?? 0) < maxDelay else { return }
+
+        // We start at a 50 millisecond delay and do a doubling backoff
+        let nextDelay: TimeInterval = if let delay {
+            delay * 2
+        } else {
+            // 100 milliseconds
+            0.05
+        }
+
+        let work: DispatchWorkItem = .init {
+            // If the callback runs before the surface is attached to a view
+            // then the window will be nil. We just reschedule in that case.
+            guard let window = to.window else {
+                moveFocus(to: to, from: from, delay: nextDelay)
+                return
+            }
+
+            // If we had a previously focused node and its not where we're sending
+            // focus, make sure that we explicitly tell it to lose focus. In theory
+            // we should NOT have to do this but the focus callback isn't getting
+            // called for some reason.
+            if let from = from {
+                _ = from.resignFirstResponder()
+            }
+
+            window.makeFirstResponder(to)
+        }
+
+        let queue = DispatchQueue.main
+        if let delay {
+            queue.asyncAfter(deadline: .now() + delay, execute: work)
+        } else {
+            queue.async(execute: work)
+        }
+    }
+    #endif
 }
 
 // MARK: Surface Environment Keys
@@ -487,15 +553,6 @@ extension FocusedValues {
         typealias Value = Ghostty.SurfaceView
     }
 
-    var ghosttySurfaceTitle: String? {
-        get { self[FocusedGhosttySurfaceTitle.self] }
-        set { self[FocusedGhosttySurfaceTitle.self] = newValue }
-    }
-
-    struct FocusedGhosttySurfaceTitle: FocusedValueKey {
-        typealias Value = String
-    }
-
     var ghosttySurfacePwd: String? {
         get { self[FocusedGhosttySurfacePwd.self] }
         set { self[FocusedGhosttySurfacePwd.self] = newValue }
@@ -503,15 +560,6 @@ extension FocusedValues {
 
     struct FocusedGhosttySurfacePwd: FocusedValueKey {
         typealias Value = String
-    }
-
-    var ghosttySurfaceZoomed: Bool? {
-        get { self[FocusedGhosttySurfaceZoomed.self] }
-        set { self[FocusedGhosttySurfaceZoomed.self] = newValue }
-    }
-
-    struct FocusedGhosttySurfaceZoomed: FocusedValueKey {
-        typealias Value = Bool
     }
 
     var ghosttySurfaceCellSize: OSSize? {
