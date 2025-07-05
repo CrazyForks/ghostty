@@ -15,10 +15,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-# We need to be in interactive mode and we need to have the Ghostty
-# resources dir set which also tells us we're running in Ghostty.
+# We need to be in interactive mode to proceed.
 if [[ "$-" != *i* ]] ; then builtin return; fi
-if [ -z "$GHOSTTY_RESOURCES_DIR" ]; then builtin return; fi
 
 # When automatic shell integration is active, we were started in POSIX
 # mode and need to manually recreate the bash startup sequence.
@@ -98,7 +96,7 @@ if [[ "$GHOSTTY_SHELL_FEATURES" == *"sudo"* && -n "$TERMINFO" ]]; then
 fi
 
 # Import bash-preexec, safe to do multiple times
-builtin source "$GHOSTTY_RESOURCES_DIR/shell-integration/bash/bash-preexec.sh"
+builtin source "$(dirname -- "${BASH_SOURCE[0]}")/bash-preexec.sh"
 
 # This is set to 1 when we're executing a command so that we don't
 # send prompt marks multiple times.
@@ -108,7 +106,6 @@ _ghostty_last_reported_cwd=""
 function __ghostty_precmd() {
     local ret="$?"
     if test "$_ghostty_executing" != "0"; then
-      _GHOSTTY_SAVE_PS0="$PS0"
       _GHOSTTY_SAVE_PS1="$PS1"
       _GHOSTTY_SAVE_PS2="$PS2"
 
@@ -125,8 +122,8 @@ function __ghostty_precmd() {
 
       # Cursor
       if [[ "$GHOSTTY_SHELL_FEATURES" == *"cursor"* ]]; then
-        PS1=$PS1'\[\e[5 q\]'
-        PS0=$PS0'\[\e[0 q\]'
+        PS1=$PS1'\[\e[5 q\]'      # blinking bar for input
+        builtin printf "\e[0 q"   # reset to default cursor
       fi
 
       # Title (working directory)
@@ -156,7 +153,6 @@ function __ghostty_precmd() {
 function __ghostty_preexec() {
     builtin local cmd="$1"
 
-    PS0="$_GHOSTTY_SAVE_PS0"
     PS1="$_GHOSTTY_SAVE_PS1"
     PS2="$_GHOSTTY_SAVE_PS2"
 
